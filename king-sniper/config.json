@@ -1,0 +1,18 @@
+{
+  "timeframes": [
+    "15m",
+    "1h",
+    "4h"
+  ],
+  "tpSlAlerts": "live",
+  "startupMessage": true,
+  "maxAlertAgeSeconds": 180,
+  "cloudMaxAlertAgeSeconds": 900,
+  "historyBars": 5000,
+  "settings": {
+    "mode": "High win-rate",
+    "autoHtf": true,
+    "acct": 100,
+    "riskPct": 0.5
+  }
+}

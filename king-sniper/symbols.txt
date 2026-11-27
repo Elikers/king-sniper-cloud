@@ -1,0 +1,8 @@
+# Markets that get Discord alerts. One per line. Write them like on TradingView: DOGEUSDC.P
+# Any Hyperliquid perpetual works (BTC, ETH, SOL, HYPE, DOGE, kPEPE, ...). Lines starting with # are ignored.
+# To add one: GitHub > Actions > "Add or remove markets" > Run workflow. Or just edit this file.
+BTCUSDC.P
+ETHUSDC.P
+SOLUSDC.P
+HYPEUSDC.P
+ZECUSDC.P
