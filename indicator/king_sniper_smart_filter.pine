@@ -1,0 +1,513 @@
+//@version=6
+indicator("King Sniper Smart Filter (Crypto / Hyperliquid)", "KSSF", overlay = true, max_labels_count = 500)
+
+// =====================================================================
+//  KING SNIPER SMART FILTER  -  symbol-agnostic (BTC, ETH, SOL, HYPE...)
+//  12 filters | news + spike protection | ratchet trailing stop
+//  partial TP1/TP2/TP3 | flip recovery | conflict guard | dashboard
+//  Signals fire on bar close only (no repainting).
+// =====================================================================
+
+// ───────────────────────── INPUTS ─────────────────────────
+gM = "0) Mode (read this first)"
+mode      = input.string("High win-rate", "Strategy mode", options = ["Custom", "High win-rate", "Max win-rate"], group = gM, tooltip = "High/Max win-rate presets override filters, stop and TP settings below: stricter entries, wider stop, closer TPs. Win rate goes up, but each win is smaller. Check Profit factor in the dashboard.")
+minConfIn = input.float(0, "Custom mode: min confidence %", minval = 0, maxval = 100, group = gM)
+autoHtf   = input.bool(true, "Auto-pick higher timeframe from chart timeframe", group = gM)
+
+gF = "1) Filter engine"
+minPassIn = input.int(10, "Min filters that must pass (of 12)", minval = 1, maxval = 12, group = gF, tooltip = "12 = strict (rare signals). 9-10 is a good starting point on crypto.")
+emaFastL  = input.int(21,  "EMA fast",  minval = 2, group = gF)
+emaSlowL  = input.int(50,  "EMA slow",  minval = 2, group = gF)
+emaTrendL = input.int(200, "EMA trend", minval = 2, group = gF)
+htfIn = input.timeframe("60", "Higher-timeframe trend", group = gF, tooltip = "Keep this above your chart timeframe.")
+htfEmaL   = input.int(50, "HTF EMA length", minval = 2, group = gF)
+rsiL      = input.int(14, "RSI length", group = gF)
+rsiMaxL   = input.float(75, "Long: RSI must be below", group = gF)
+rsiMinS   = input.float(25, "Short: RSI must be above", group = gF)
+adxMin    = input.float(20, "ADX minimum", group = gF)
+atrL      = input.int(14, "ATR length", group = gF)
+atrRelMin = input.float(0.5, "Min ATR vs its 100-bar average (x)", step = 0.1, group = gF)
+atrRelMax = input.float(3.0,  "Max ATR % of price", step = 0.1,  group = gF)
+volMult   = input.float(1.0, "Volume > SMA(20) x", step = 0.1, group = gF)
+stFactor  = input.float(3.0, "Supertrend factor", step = 0.1, group = gF)
+stLen     = input.int(10, "Supertrend ATR length", group = gF)
+brkLen    = input.int(20, "Breakout lookback (bars)", group = gF)
+brkRecent = input.int(3,  "Breakout must be within last N bars", group = gF)
+
+gT = "2) Filter on/off"
+u1  = input.bool(true, "1  EMA fast/slow stack", group = gT)
+u2  = input.bool(true, "2  Price vs EMA trend", group = gT)
+u3  = input.bool(true, "3  HTF trend", group = gT)
+u4  = input.bool(true, "4  RSI", group = gT)
+u5  = input.bool(true, "5  MACD histogram", group = gT)
+u6  = input.bool(true, "6  ADX + DI", group = gT)
+u7  = input.bool(true, "7  ATR volatility band", group = gT)
+u8  = input.bool(true, "8  Volume", group = gT)
+u9  = input.bool(true, "9  Supertrend", group = gT)
+u10 = input.bool(true, "10 Breakout structure", group = gT)
+u11 = input.bool(false, "11 Session filter (hard gate)", group = gT)
+u12 = input.bool(true, "12 News / spike protection (hard gate)", group = gT)
+
+gS = "3) Session"
+sessTz  = input.string("Asia/Manila", "Timezone for session & news windows", group = gS)
+sessStr = input.session("0800-2200", "Allowed trading session (PHT, used by filter 11)", group = gS)
+
+gN = "4) Dual news protection"
+nw1On  = input.bool(false, "Blackout window 1", group = gN, inline = "n1")
+nw1    = input.session("2100-2200", "", group = gN, inline = "n1")
+nw2On  = input.bool(false, "Blackout window 2", group = gN, inline = "n2")
+nw2    = input.session("0200-0300", "", group = gN, inline = "n2")
+nw3On  = input.bool(false, "Blackout window 3", group = gN, inline = "n3")
+nw3    = input.session("0000-0100", "", group = gN, inline = "n3")
+spikeOn   = input.bool(true, "Spike guard (blocks after abnormal candles)", group = gN)
+spikeMult = input.float(2.5, "Spike = true range > ATR x", step = 0.1, group = gN)
+spikeCool = input.int(3, "Block entries for N bars after spike", group = gN)
+
+gR = "5) Trade management"
+slMultIn = input.float(1.5, "Stop loss = ATR x", step = 0.1, group = gR)
+tp1RIn = input.float(1.0, "TP1 (R multiple)", step = 0.25, group = gR)
+tp2RIn = input.float(2.0, "TP2 (R multiple)", step = 0.25, group = gR)
+tp3RIn = input.float(3.0, "TP3 (R multiple)", step = 0.25, group = gR)
+p1In = input.float(0.40, "Close % at TP1", minval = 0, maxval = 1, step = 0.05, group = gR)
+p2In = input.float(0.30, "Close % at TP2", minval = 0, maxval = 1, step = 0.05, group = gR, tooltip = "Remainder closes at TP3.")
+ratchetOn = input.bool(true, "Ratchet: TP1 -> stop to entry, TP2 -> stop to TP1", group = gR)
+trailOn   = input.bool(true, "ATR trailing stop after TP1 (only moves in profit direction)", group = gR)
+trailMult = input.float(2.0, "Trail distance = ATR x", step = 0.1, group = gR)
+cooldown  = input.int(3, "Cooldown bars after a trade closes", group = gR, tooltip = "Conflict guard: no new signal while a trade is live, plus this pause after it closes.")
+
+gFl = "6) Flip recovery"
+flipOn   = input.bool(true, "Enable flip after a full stop-out", group = gFl)
+flipBars = input.int(6, "Flip window (bars after the stop)", group = gFl)
+flipMin  = input.int(8, "Min filters for the opposite side", minval = 1, maxval = 12, group = gFl)
+maxFlips = input.int(1, "Max consecutive flips (safety limit)", minval = 0, group = gFl)
+
+gRk = "7) Risk calculator"
+acct    = input.float(100.0, "Account size (USDC)", group = gRk)
+riskPct = input.float(0.5, "Risk per trade %", step = 0.1, group = gRk, tooltip = "Drawdown scales with this. Check 'Suggested risk %' in the dashboard.")
+
+gDd = "7b) Drawdown protection"
+ddTarget   = input.float(15.0, "Target max drawdown %", step = 1.0, group = gDd)
+ddHalt     = input.float(12.0, "Pause new entries when drawdown reaches %", step = 1.0, group = gDd)
+maxLoss    = input.int(3, "Pause after N losing trades in a row", minval = 1, group = gDd)
+dailyLossR = input.float(3.0, "Daily loss limit (R)", step = 0.5, group = gDd)
+pauseHrs   = input.float(8.0, "Pause length (hours)", minval = 0.1, group = gDd)
+
+gTm = "7c) Best time to trade (Philippines, PHT = UTC+8)"
+showSess      = input.bool(true, "Shade market sessions on chart", group = gTm)
+showTok       = input.bool(true, "Tokyo session", group = gTm)
+showLon       = input.bool(true, "London session", group = gTm)
+showNY        = input.bool(true, "New York session", group = gTm)
+useHourGate   = input.bool(false, "Skip PHT hours that historically lose", group = gTm, tooltip = "Uses this script's own simulated trades per hour of day (PHT). Hours with too few trades stay allowed so they can still be learned.")
+minHourTrades = input.int(5, "Min trades before an hour is rated", minval = 1, group = gTm)
+blockBelowR   = input.float(0.0, "Block rated hours with avg R below", step = 0.05, group = gTm)
+showHourTbl   = input.bool(true, "Show best-hours heatmap (hover cells for details)", group = gTm)
+tbl2Pos       = input.string(position.bottom_left, "Heatmap position", options = [position.bottom_left, position.bottom_right, position.top_left, position.top_right], group = gTm)
+
+gD = "8) Display"
+showTbl = input.bool(true, "Show dashboard", group = gD)
+tblPos  = input.string(position.top_right, "Dashboard position", options = [position.top_right, position.top_left, position.bottom_right, position.bottom_left], group = gD)
+showEma = input.bool(true, "Plot EMAs", group = gD)
+
+// ───────────── effective settings (mode presets, timeframe scaling) ─────────────
+bool isHigh = mode == "High win-rate"
+bool isMax  = mode == "Max win-rate"
+int   minPass = isMax ? 12 : isHigh ? 11 : minPassIn
+float minConf = isMax ? 85.0 : isHigh ? 80.0 : minConfIn
+float slMult  = isMax ? 3.0 : isHigh ? 2.5 : slMultIn
+float tp1R    = isMax ? 0.4 : isHigh ? 0.5 : tp1RIn
+float tp2R    = isMax ? 0.8 : isHigh ? 1.0 : tp2RIn
+float tp3R    = isMax ? 1.2 : isHigh ? 1.5 : tp3RIn
+float p1      = isMax ? 0.6 : isHigh ? 0.5 : p1In
+float p2      = isMax ? 0.25 : isHigh ? 0.3 : p2In
+int   tfs     = timeframe.in_seconds()
+int   pauseBars = math.max(1, math.ceil(pauseHrs * 3600 / tfs))
+string autoTf = tfs <= 180 ? "15" : tfs <= 900 ? "60" : tfs <= 3600 ? "240" : tfs <= 14400 ? "D" : tfs <= 86400 ? "W" : "M"
+string htfTf  = autoHtf ? autoTf : htfIn
+
+// ───────────────────────── HELPERS ─────────────────────────
+b2i(b) => b ? 1 : 0
+mark(b) => b ? "✔" : "✘"
+clr(b) => b ? color.new(color.green, 15) : color.new(color.red, 15)
+bgDark = color.new(#1e222d, 0)
+hh2(h) => (h < 10 ? "0" : "") + str.tostring(h) + ":00"
+
+// ───────────────────────── INDICATORS ─────────────────────────
+emaF = ta.ema(close, emaFastL)
+emaS = ta.ema(close, emaSlowL)
+emaT = ta.ema(close, emaTrendL)
+
+[htfC, htfE] = request.security(syminfo.tickerid, htfTf, [close[1], ta.ema(close, htfEmaL)[1]], lookahead = barmerge.lookahead_on)
+
+rsi = ta.rsi(close, rsiL)
+[macdLine, macdSig, macdHist] = ta.macd(close, 12, 26, 9)
+[diPlus, diMinus, adx] = ta.dmi(14, 14)
+atr = ta.atr(atrL)
+atrPct = atr / close * 100
+atrAvg = ta.sma(atr, 100)
+volAvg = ta.sma(volume, 20)
+[stLine, stDir] = ta.supertrend(stFactor, stLen)
+trVal = ta.tr(true)
+
+donHi = ta.highest(high, brkLen)[1]
+donLo = ta.lowest(low, brkLen)[1]
+sinceBrkUp = ta.barssince(close > donHi)
+sinceBrkDn = ta.barssince(close < donLo)
+sinceSpike = ta.barssince(trVal > atr * spikeMult)
+
+inSess = not na(time(timeframe.period, sessStr, sessTz))
+inNw1  = nw1On and not na(time(timeframe.period, nw1, sessTz))
+inNw2  = nw2On and not na(time(timeframe.period, nw2, sessTz))
+inNw3  = nw3On and not na(time(timeframe.period, nw3, sessTz))
+
+// ───────────────────────── 12 FILTERS ─────────────────────────
+volOk   = na(volume) or volume > volAvg * volMult
+spikeOk = not spikeOn or nz(sinceSpike, 9999) > spikeCool
+newsOk  = not (inNw1 or inNw2 or inNw3) and spikeOk
+
+f1L  = not u1 or emaF > emaS
+f1S  = not u1 or emaF < emaS
+f2L  = not u2 or close > emaT
+f2S  = not u2 or close < emaT
+f3L  = not u3 or htfC > htfE
+f3S  = not u3 or htfC < htfE
+f4L  = not u4 or (rsi > 50 and rsi < rsiMaxL)
+f4S  = not u4 or (rsi < 50 and rsi > rsiMinS)
+f5L  = not u5 or (macdHist > 0 and macdHist > macdHist[1])
+f5S  = not u5 or (macdHist < 0 and macdHist < macdHist[1])
+f6L  = not u6 or (adx > adxMin and diPlus > diMinus)
+f6S  = not u6 or (adx > adxMin and diMinus > diPlus)
+f7   = not u7 or (atr >= atrAvg * atrRelMin and atr <= atrAvg * atrRelMax)
+f8   = not u8 or volOk
+f9L  = not u9 or stDir < 0
+f9S  = not u9 or stDir > 0
+f10L = not u10 or nz(sinceBrkUp, 9999) <= brkRecent
+f10S = not u10 or nz(sinceBrkDn, 9999) <= brkRecent
+f11  = not u11 or inSess
+f12  = not u12 or newsOk
+
+scoreL = b2i(f1L) + b2i(f2L) + b2i(f3L) + b2i(f4L) + b2i(f5L) + b2i(f6L) + b2i(f7) + b2i(f8) + b2i(f9L) + b2i(f10L) + b2i(f11) + b2i(f12)
+scoreS = b2i(f1S) + b2i(f2S) + b2i(f3S) + b2i(f4S) + b2i(f5S) + b2i(f6S) + b2i(f7) + b2i(f8) + b2i(f9S) + b2i(f10S) + b2i(f11) + b2i(f12)
+
+confL = math.round(scoreL / 12.0 * 75 + math.min(adx, 40) / 40.0 * 25)
+confS = math.round(scoreS / 12.0 * 75 + math.min(adx, 40) / 40.0 * 25)
+gate    = f11 and f12
+longRaw  = scoreL >= minPass and confL >= minConf and gate
+shortRaw = scoreS >= minPass and confS >= minConf and gate
+longTrig  = longRaw and not longRaw[1]
+shortTrig = shortRaw and not shortRaw[1]
+
+// ───────────────────────── TRADE ENGINE (simulated) ─────────────────────────
+var int dir = 0
+var float entry = na
+var float sl = na
+var float tp1 = na
+var float tp2 = na
+var float tp3 = na
+var float risk = na
+var bool t1 = false
+var bool t2 = false
+var float rem = 1.0
+var float tradeR = 0.0
+var int lastCloseBar = na
+var int lastCloseDir = 0
+var bool lastFullSL = false
+var int flipCount = 0
+var int trades = 0
+var int wins = 0
+var float totalR = 0.0
+var float qty = na
+var float eq = 100.0
+var float peakEq = 100.0
+var float maxDD = 0.0
+var float cumR = 0.0
+var float peakR = 0.0
+var float maxDDR = 0.0
+var int consecLoss = 0
+var float dayR = 0.0
+var int pausedUntil = 0
+var array<int> arrT = array.new_int(13, 0)
+var array<int> arrW = array.new_int(13, 0)
+var int entryScore = 0
+var float lastConf = na
+var float sumW = 0.0
+var float sumL = 0.0
+var float lastWR = na
+var int lastN = 0
+var array<int> hrT = array.new_int(24, 0)
+var array<int> hrW = array.new_int(24, 0)
+var array<float> hrR = array.new_float(24, 0.0)
+var int entryHour = 0
+
+if timeframe.change("D")
+    dayR := 0.0
+
+bool tp1Now = false
+bool tp2Now = false
+bool tp3Now = false
+bool slNow = false
+bool trailNow = false
+bool closedNow = false
+
+// 1) manage the open trade (stop is checked first = conservative)
+if dir != 0
+    bool stopped = dir == 1 ? low <= sl : high >= sl
+    if stopped
+        tradeR += rem * dir * (sl - entry) / risk
+        closedNow := true
+        if t1
+            trailNow := true
+        else
+            slNow := true
+    else
+        if not t1 and (dir == 1 ? high >= tp1 : low <= tp1)
+            t1 := true
+            tp1Now := true
+            tradeR += p1 * tp1R
+            rem -= p1
+            if ratchetOn
+                sl := dir == 1 ? math.max(sl, entry) : math.min(sl, entry)
+        if t1 and not t2 and (dir == 1 ? high >= tp2 : low <= tp2)
+            t2 := true
+            tp2Now := true
+            tradeR += p2 * tp2R
+            rem -= p2
+            if ratchetOn
+                sl := dir == 1 ? math.max(sl, tp1) : math.min(sl, tp1)
+        if t2 and (dir == 1 ? high >= tp3 : low <= tp3)
+            tp3Now := true
+            tradeR += rem * tp3R
+            rem := 0.0
+            closedNow := true
+        if t1 and trailOn and not closedNow
+            float trailPx = dir == 1 ? close - atr * trailMult : close + atr * trailMult
+            sl := dir == 1 ? math.max(sl, trailPx) : math.min(sl, trailPx)
+
+// 2) book the closed trade
+if closedNow
+    trades += 1
+    if tradeR > 0
+        wins += 1
+    totalR += tradeR
+    if tradeR > 0
+        sumW += tradeR
+    else
+        sumL += -tradeR
+    array.set(arrT, entryScore, array.get(arrT, entryScore) + 1)
+    if tradeR > 0
+        array.set(arrW, entryScore, array.get(arrW, entryScore) + 1)
+    array.set(hrT, entryHour, array.get(hrT, entryHour) + 1)
+    if tradeR > 0
+        array.set(hrW, entryHour, array.get(hrW, entryHour) + 1)
+    array.set(hrR, entryHour, array.get(hrR, entryHour) + tradeR)
+    eq := eq * (1 + tradeR * riskPct / 100)
+    peakEq := math.max(peakEq, eq)
+    float ddNow = (peakEq - eq) / peakEq * 100
+    maxDD := math.max(maxDD, ddNow)
+    cumR += tradeR
+    peakR := math.max(peakR, cumR)
+    maxDDR := math.max(maxDDR, peakR - cumR)
+    dayR += tradeR
+    consecLoss := tradeR > 0 ? 0 : consecLoss + 1
+    if consecLoss >= maxLoss or ddNow >= ddHalt
+        pausedUntil := bar_index + pauseBars
+        consecLoss := 0
+    lastCloseBar := bar_index
+    lastCloseDir := dir
+    lastFullSL := slNow
+    dir := 0
+
+// 3) entries (conflict guard: only when flat, after cooldown)
+int curHr = hour(time, "Asia/Manila")
+avgArr = array.new_float(24, -999.0)
+for h = 0 to 23
+    int hn = array.get(hrT, h)
+    if hn >= minHourTrades
+        array.set(avgArr, h, array.get(hrR, h) / hn)
+float curAvg = array.get(avgArr, curHr)
+bool hourOk = not useHourGate or not timeframe.isintraday or curAvg == -999.0 or curAvg >= blockBelowR
+
+bool cdOk = na(lastCloseBar) or bar_index - lastCloseBar >= cooldown
+bool flipWin = flipOn and lastFullSL and not na(lastCloseBar) and bar_index - lastCloseBar <= flipBars and bar_index > lastCloseBar and flipCount < maxFlips
+bool normL = longTrig and cdOk and barstate.isconfirmed
+bool normS = shortTrig and cdOk and barstate.isconfirmed
+bool flipL = flipWin and lastCloseDir == -1 and scoreL >= flipMin and gate and barstate.isconfirmed
+bool flipS = flipWin and lastCloseDir == 1 and scoreS >= flipMin and gate and barstate.isconfirmed
+
+bool riskOk = bar_index >= pausedUntil and dayR > -dailyLossR and hourOk
+bool goLong = dir == 0 and not closedNow and riskOk and (normL or flipL)
+bool goShort = dir == 0 and not closedNow and riskOk and (normS or flipS)
+bool bothSides = goLong and goShort
+goLong := goLong and not bothSides
+goShort := goShort and not bothSides
+bool isFlip = (goLong and flipL and not normL) or (goShort and flipS and not normS)
+
+if goLong or goShort
+    dir := goLong ? 1 : -1
+    entry := close
+    risk := math.max(atr * slMult, syminfo.mintick * 5)
+    sl := entry - dir * risk
+    tp1 := entry + dir * risk * tp1R
+    tp2 := entry + dir * risk * tp2R
+    tp3 := entry + dir * risk * tp3R
+    t1 := false
+    t2 := false
+    rem := 1.0
+    tradeR := 0.0
+    qty := acct * riskPct / 100 / risk
+    int sc = goLong ? scoreL : scoreS
+    entryScore := sc
+    entryHour := curHr
+    lastConf := math.round(sc / 12.0 * 75 + math.min(adx, 40) / 40.0 * 25)
+    int nT = array.get(arrT, sc)
+    lastN := nT
+    lastWR := nT >= 5 ? array.get(arrW, sc) * 100.0 / nT : na
+    string wrTxt = na(lastWR) ? "n/a (n=" + str.tostring(nT) + ")" : str.tostring(lastWR, "#") + "% (n=" + str.tostring(nT) + ")"
+    string lbl = (isFlip ? "FLIP " : "") + (goLong ? "BUY" : "SELL") + "\nConf " + str.tostring(lastConf, "#") + "%\nWR " + wrTxt
+    color lblCol = isFlip ? color.purple : goLong ? color.green : color.red
+    label.new(bar_index, goLong ? low : high, lbl, yloc = goLong ? yloc.belowbar : yloc.abovebar, style = goLong ? label.style_label_up : label.style_label_down, color = lblCol, textcolor = color.white, size = size.small)
+    if isFlip
+        flipCount += 1
+    else
+        flipCount := 0
+
+// ───────────────────────── PLOTS ─────────────────────────
+plot(showEma ? emaF : na, "EMA fast", color.new(color.aqua, 20))
+plot(showEma ? emaS : na, "EMA slow", color.new(color.orange, 20))
+plot(showEma ? emaT : na, "EMA trend", color.new(color.gray, 20), 2)
+
+plot(dir != 0 ? entry : na, "Entry", color.gray, 1, plot.style_linebr)
+plot(dir != 0 ? sl : na, "Stop / Trail", color.red, 2, plot.style_linebr)
+plot(dir != 0 ? tp1 : na, "TP1", color.new(color.green, 30), 1, plot.style_linebr)
+plot(dir != 0 ? tp2 : na, "TP2", color.new(color.green, 15), 1, plot.style_linebr)
+plot(dir != 0 ? tp3 : na, "TP3", color.green, 2, plot.style_linebr)
+
+
+plotshape(tp1Now ? tp1 : na, "TP1 hit", shape.diamond, location.absolute, color.lime, size = size.tiny, text = "TP1")
+plotshape(tp2Now ? tp2 : na, "TP2 hit", shape.diamond, location.absolute, color.lime, size = size.tiny, text = "TP2")
+plotshape(tp3Now ? tp3 : na, "TP3 hit", shape.diamond, location.absolute, color.lime, size = size.tiny, text = "TP3")
+plotshape(slNow ? sl : na, "SL hit", shape.xcross, location.absolute, color.red, size = size.tiny, text = "SL")
+plotshape(trailNow ? sl : na, "Trail hit", shape.xcross, location.absolute, color.orange, size = size.tiny, text = "TRAIL")
+
+// ───────────────────────── ALERTS ─────────────────────────
+tokRaw = timeframe.isintraday and not na(time(timeframe.period, "0900-1800", "Asia/Tokyo"))
+lonRaw = timeframe.isintraday and not na(time(timeframe.period, "0800-1630", "Europe/London"))
+nyRaw  = timeframe.isintraday and not na(time(timeframe.period, "0830-1700", "America/New_York"))
+bgcolor(showSess and showTok and tokRaw ? color.new(color.blue, 92) : na, title = "Tokyo session")
+bgcolor(showSess and showLon and lonRaw ? color.new(color.orange, 92) : na, title = "London session")
+bgcolor(showSess and showNY and nyRaw ? color.new(color.green, 92) : na, title = "New York session")
+
+alertcondition(goLong, "KSSF BUY", "KSSF BUY signal on {{ticker}} ({{interval}})")
+alertcondition(goShort, "KSSF SELL", "KSSF SELL signal on {{ticker}} ({{interval}})")
+alertcondition(tp1Now, "KSSF TP1", "KSSF TP1 hit on {{ticker}}")
+alertcondition(tp2Now, "KSSF TP2", "KSSF TP2 hit on {{ticker}}")
+alertcondition(tp3Now, "KSSF TP3", "KSSF TP3 hit on {{ticker}}")
+alertcondition(slNow or trailNow, "KSSF STOP", "KSSF stop hit on {{ticker}}")
+
+// ───────────────────────── DASHBOARD ─────────────────────────
+var table tbl = table.new(tblPos, 3, 27, border_width = 1, frame_color = color.gray, frame_width = 1)
+
+if barstate.islast and showTbl
+    table.cell(tbl, 0, 0, "KING SNIPER", text_color = color.white, bgcolor = color.new(color.gray, 20), text_size = size.small)
+    table.cell(tbl, 1, 0, "LONG", text_color = color.white, bgcolor = color.new(color.gray, 20), text_size = size.small)
+    table.cell(tbl, 2, 0, "SHORT", text_color = color.white, bgcolor = color.new(color.gray, 20), text_size = size.small)
+
+    names = array.from("1 EMA stack", "2 Price vs EMA200", "3 HTF trend", "4 RSI", "5 MACD", "6 ADX / DI", "7 ATR band", "8 Volume", "9 Supertrend", "10 Breakout", "11 Session", "12 News / spike")
+    ls = array.from(f1L, f2L, f3L, f4L, f5L, f6L, f7, f8, f9L, f10L, f11, f12)
+    ss = array.from(f1S, f2S, f3S, f4S, f5S, f6S, f7, f8, f9S, f10S, f11, f12)
+
+    for i = 0 to 11
+        table.cell(tbl, 0, i + 1, array.get(names, i), text_color = color.white, bgcolor = bgDark, text_halign = text.align_left, text_size = size.small)
+        table.cell(tbl, 1, i + 1, mark(array.get(ls, i)), text_color = color.white, bgcolor = clr(array.get(ls, i)), text_size = size.small)
+        table.cell(tbl, 2, i + 1, mark(array.get(ss, i)), text_color = color.white, bgcolor = clr(array.get(ss, i)), text_size = size.small)
+
+    table.cell(tbl, 0, 13, "Score (need " + str.tostring(minPass) + ")", text_color = color.white, bgcolor = bgDark, text_halign = text.align_left, text_size = size.small)
+    table.cell(tbl, 1, 13, str.tostring(scoreL) + "/12", text_color = color.white, bgcolor = clr(scoreL >= minPass), text_size = size.small)
+    table.cell(tbl, 2, 13, str.tostring(scoreS) + "/12", text_color = color.white, bgcolor = clr(scoreS >= minPass), text_size = size.small)
+
+    string stat = dir == 1 ? "LONG" : dir == -1 ? "SHORT" : "FLAT"
+    table.cell(tbl, 0, 14, "Position", text_color = color.white, bgcolor = bgDark, text_halign = text.align_left, text_size = size.small)
+    table.cell(tbl, 1, 14, stat, text_color = color.white, bgcolor = bgDark, text_size = size.small)
+    table.cell(tbl, 2, 14, dir != 0 ? (t2 ? "TP2+" : t1 ? "TP1+" : "open") : "-", text_color = color.white, bgcolor = bgDark, text_size = size.small)
+
+    table.cell(tbl, 0, 15, "Trades / Win%", text_color = color.white, bgcolor = bgDark, text_halign = text.align_left, text_size = size.small)
+    table.cell(tbl, 1, 15, str.tostring(trades), text_color = color.white, bgcolor = bgDark, text_size = size.small)
+    table.cell(tbl, 2, 15, trades > 0 ? str.tostring(wins * 100.0 / trades, "#.0") + "%" : "-", text_color = color.white, bgcolor = bgDark, text_size = size.small)
+
+    table.cell(tbl, 0, 16, "Net R (sim)", text_color = color.white, bgcolor = bgDark, text_halign = text.align_left, text_size = size.small)
+    table.cell(tbl, 1, 16, str.tostring(totalR, "#.00"), text_color = color.white, bgcolor = clr(totalR >= 0), text_size = size.small)
+    table.cell(tbl, 2, 16, "", text_color = color.white, bgcolor = bgDark, text_size = size.small)
+
+    table.cell(tbl, 0, 17, "Size @ " + str.tostring(riskPct, "#.#") + "% risk", text_color = color.white, bgcolor = bgDark, text_halign = text.align_left, text_size = size.small)
+    table.cell(tbl, 1, 17, dir != 0 ? str.tostring(qty, "#.####") : "-", text_color = color.white, bgcolor = bgDark, text_size = size.small)
+    table.cell(tbl, 2, 17, dir != 0 ? str.tostring(qty * entry, "#.##") + " USDC" : "", text_color = color.white, bgcolor = bgDark, text_size = size.small)
+
+    table.cell(tbl, 0, 18, "Max DD (sim) / target", text_color = color.white, bgcolor = bgDark, text_halign = text.align_left, text_size = size.small)
+    table.cell(tbl, 1, 18, str.tostring(maxDD, "#.0") + "%", text_color = color.white, bgcolor = clr(maxDD <= ddTarget), text_size = size.small)
+    table.cell(tbl, 2, 18, str.tostring(ddTarget, "#.0") + "%", text_color = color.white, bgcolor = bgDark, text_size = size.small)
+
+    table.cell(tbl, 0, 19, "Worst streak (R)", text_color = color.white, bgcolor = bgDark, text_halign = text.align_left, text_size = size.small)
+    table.cell(tbl, 1, 19, str.tostring(maxDDR, "#.0") + "R", text_color = color.white, bgcolor = bgDark, text_size = size.small)
+    table.cell(tbl, 2, 19, "", text_color = color.white, bgcolor = bgDark, text_size = size.small)
+
+    table.cell(tbl, 0, 20, "Suggested risk %", text_color = color.white, bgcolor = bgDark, text_halign = text.align_left, text_size = size.small)
+    table.cell(tbl, 1, 20, maxDDR > 0 ? str.tostring(ddTarget * 0.5 / maxDDR, "#.00") + "%" : "-", text_color = color.white, bgcolor = bgDark, text_size = size.small)
+    table.cell(tbl, 2, 20, "", text_color = color.white, bgcolor = bgDark, text_size = size.small)
+
+    bool paused = bar_index < pausedUntil or dayR <= -dailyLossR
+    table.cell(tbl, 0, 21, "Entries", text_color = color.white, bgcolor = bgDark, text_halign = text.align_left, text_size = size.small)
+    table.cell(tbl, 1, 21, paused ? "PAUSED" : "ACTIVE", text_color = color.white, bgcolor = clr(not paused), text_size = size.small)
+    table.cell(tbl, 2, 21, "", text_color = color.white, bgcolor = bgDark, text_size = size.small)
+
+    table.cell(tbl, 0, 22, "Last entry confidence", text_color = color.white, bgcolor = bgDark, text_halign = text.align_left, text_size = size.small)
+    table.cell(tbl, 1, 22, na(lastConf) ? "-" : str.tostring(lastConf, "#") + "%", text_color = color.white, bgcolor = bgDark, text_size = size.small)
+    table.cell(tbl, 2, 22, "", text_color = color.white, bgcolor = bgDark, text_size = size.small)
+
+    table.cell(tbl, 0, 23, "Hist win rate @ that score", text_color = color.white, bgcolor = bgDark, text_halign = text.align_left, text_size = size.small)
+    table.cell(tbl, 1, 23, na(lastWR) ? "n/a" : str.tostring(lastWR, "#") + "%", text_color = color.white, bgcolor = bgDark, text_size = size.small)
+    table.cell(tbl, 2, 23, "n=" + str.tostring(lastN), text_color = color.white, bgcolor = bgDark, text_size = size.small)
+
+    int losses = trades - wins
+    float avgW = wins > 0 ? sumW / wins : na
+    float avgL = losses > 0 ? sumL / losses : na
+    table.cell(tbl, 0, 24, "Avg win / avg loss (R)", text_color = color.white, bgcolor = bgDark, text_halign = text.align_left, text_size = size.small)
+    table.cell(tbl, 1, 24, na(avgW) ? "-" : "+" + str.tostring(avgW, "#.00"), text_color = color.white, bgcolor = bgDark, text_size = size.small)
+    table.cell(tbl, 2, 24, na(avgL) ? "-" : "-" + str.tostring(avgL, "#.00"), text_color = color.white, bgcolor = bgDark, text_size = size.small)
+
+    table.cell(tbl, 0, 25, "Profit factor", text_color = color.white, bgcolor = bgDark, text_halign = text.align_left, text_size = size.small)
+    table.cell(tbl, 1, 25, sumL > 0 ? str.tostring(sumW / sumL, "#.00") : "-", text_color = color.white, bgcolor = clr(sumL > 0 and sumW / sumL >= 1.2), text_size = size.small)
+    table.cell(tbl, 2, 25, "", text_color = color.white, bgcolor = bgDark, text_size = size.small)
+
+    table.cell(tbl, 0, 26, "Mode / HTF", text_color = color.white, bgcolor = bgDark, text_halign = text.align_left, text_size = size.small)
+    table.cell(tbl, 1, 26, mode, text_color = color.white, bgcolor = bgDark, text_size = size.small)
+    table.cell(tbl, 2, 26, htfTf, text_color = color.white, bgcolor = bgDark, text_size = size.small)
+
+// ───────────────────────── BEST-HOURS HEATMAP (PHT) ─────────────────────────
+var table tbl2 = table.new(tbl2Pos, 6, 6, border_width = 1, frame_color = color.gray, frame_width = 1)
+
+if barstate.isfirst
+    table.merge_cells(tbl2, 0, 0, 5, 0)
+    table.merge_cells(tbl2, 0, 5, 5, 5)
+
+if barstate.islast and showHourTbl
+    sortIdx = array.sort_indices(avgArr, order.descending)
+    string best = ""
+    for k = 0 to 2
+        int bh = array.get(sortIdx, k)
+        if array.get(avgArr, bh) > 0
+            best := best + (best == "" ? "" : ", ") + hh2(bh)
+    table.cell(tbl2, 0, 0, "BEST PHT HOURS: " + (best == "" ? "learning (need " + str.tostring(minHourTrades) + "+ trades/hour)" : best), text_color = color.white, bgcolor = color.new(color.gray, 20), text_size = size.small)
+
+    for r = 0 to 3
+        for c = 0 to 5
+            int h = r * 6 + c
+            int hn2 = array.get(hrT, h)
+            float av = array.get(avgArr, h)
+            bool rated = av > -999.0
+            bool isBest = rated and av > 0 and h == array.get(sortIdx, 0)
+            color bgc = not rated ? color.new(color.gray, 25) : av > 0 ? color.new(color.green, 15) : color.new(color.red, 15)
+            string tx = hh2(h) + (isBest ? " ★" : "") + (h == curHr ? " ◀" : "") + "\n" + (rated ? str.tostring(av, "#.00") + "R" : "-")
+            string tip = "Hour " + hh2(h) + " PHT" + "\nTrades: " + str.tostring(hn2) + "\nWins: " + str.tostring(array.get(hrW, h)) + "\nNet R: " + str.tostring(array.get(hrR, h), "#.00")
+            table.cell(tbl2, c, r + 1, tx, text_color = color.white, bgcolor = bgc, text_size = size.tiny, tooltip = tip)
+
+    string act = (tokRaw ? "Tokyo " : "") + (lonRaw ? "London " : "") + (nyRaw ? "NewYork" : "")
+    table.cell(tbl2, 0, 5, "Now " + hh2(curHr) + " PHT | " + (act == "" ? "off-session" : act) + " | entries " + (hourOk ? "allowed" : "blocked"), text_color = color.white, bgcolor = color.new(color.gray, 20), text_size = size.small)
