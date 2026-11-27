@@ -1,0 +1,57 @@
+name: King Sniper alerts
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+    inputs:
+      test_alert:
+        description: 'Only send a test message to Discord (checks that the webhook works)'
+        type: boolean
+        default: false
+
+concurrency:
+  group: king-sniper
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  alerts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Restore saved state
+        if: ${{ !inputs.test_alert }}
+        uses: actions/cache@v4
+        with:
+          path: data
+          key: ks-state-${{ github.run_id }}
+          restore-keys: ks-state-
+
+      - name: Send test alert
+        if: ${{ inputs.test_alert }}
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: node server/index.js --test-alert
+
+      - name: Check markets and send alerts
+        if: ${{ !inputs.test_alert }}
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: node server/run-once.js
+
+      - name: Keep the schedule alive
+        if: ${{ !inputs.test_alert }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow enable alerts.yml --repo "$GITHUB_REPOSITORY"
