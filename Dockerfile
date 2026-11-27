@@ -1,7 +1,11 @@
 FROM node:22-alpine
 WORKDIR /app
-COPY . .
-ENV HOST=0.0.0.0 PORT=8080
+COPY package.json config.json ./
+COPY server ./server
+COPY public ./public
+COPY indicator ./indicator
+COPY test ./test
+RUN npm test
+ENV HOST=0.0.0.0 PORT=8080 KS_CLOUD=1 KS_ALERTS_ONLY=1 KS_STATE=/app/data/state.json
 EXPOSE 8080
-# pass the webhook at run time:  docker run -d --restart always --env-file .env -e HOST=0.0.0.0 -p 8080:8080 -v ks-data:/app/data king-sniper
 CMD ["node", "server/index.js"]

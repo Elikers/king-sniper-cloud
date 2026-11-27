@@ -91,7 +91,7 @@ export function createSender({ webhookUrl, queue = [], onChange = () => {}, onEx
       const item = queue[0];
       let r;
       try { r = await post(item.payload); } catch (e) { r = { retryMs: Math.min(60000, 2000 * 2 ** attempt), error: 'network: ' + (e.cause?.code || e.name) }; }
-      if (r.ok) { queue.shift(); attempt = 0; status.lastSentAt = now(); status.lastError = ''; onChange(); continue; }
+      if (r.ok) { queue.shift(); attempt = 0; status.lastSentAt = now(); status.lastError = ''; log('[discord] delivered ' + item.payload.embeds.length + ' embed(s)'); onChange(); continue; }
       status.lastError = r.error;
       log('[discord] ' + r.error);
       if (r.fatal) { queue.shift(); attempt = 0; onChange(); continue; } // Discord refuses it: retrying cannot help

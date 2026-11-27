@@ -33,6 +33,7 @@ function loadConfig() {
 loadEnv();
 const config = loadConfig();
 const webhookUrl = process.env.DISCORD_WEBHOOK_URL || '';
+if (process.env.KS_CLOUD === '1' && !/^https:\/\/discord(?:app)?\.com\/api\/webhooks\/\d+\/[A-Za-z0-9_-]+$/.test(webhookUrl)) { console.error('Missing or invalid Discord webhook secret'); process.exit(1); }
 const log = (m) => console.log(new Date().toISOString(), m);
 
 if (process.argv.includes('--test-alert')) {
@@ -59,6 +60,8 @@ const server = createServer(async (req, res) => {
   try {
     if (req.method !== 'GET') return reply(405, 'text/plain', 'Method not allowed');
     const path = decodeURIComponent(new URL(req.url, 'http://x').pathname);
+    if (path === '/healthz') return reply(200, 'text/plain', 'ok');
+    if (process.env.KS_ALERTS_ONLY === '1') return reply(404, 'text/plain', 'Alerts worker only');
     if (path === '/api/status') {
       return reply(200, 'application/json', JSON.stringify({
         startedAt, websocket: wsUp, symbols: alerts.coins.map(KS.symbolOf), timeframes: config.timeframes, settings: config.settings || {},
