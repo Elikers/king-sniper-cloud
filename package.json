@@ -1,0 +1,14 @@
+{
+  "name": "king-sniper-invo",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Live Hyperliquid charts + King Sniper Smart Filter signals with Discord alerts",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "start": "node server/index.js",
+    "test-alert": "node server/index.js --test-alert",
+    "test": "node --test --test-force-exit test/engine.test.js test/alerts.test.js",
+    "build": "node build-standalone.js"
+  }
+}
